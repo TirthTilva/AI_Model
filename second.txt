@@ -1,0 +1,109 @@
+# TASK: Refactor existing PPE fulfillment app from hybrid pipeline to a ReAct agent
+
+## CONTEXT
+I already have a working implementation of this system (hybrid fuzzy-match +
+event-sourced ledger approach). It correctly parses orders, does fuzzy matching against
+the catalog, falls back to an LLM for ambiguous items, checks primary/alt warehouse
+stock, computes a risk score, and dispatches/reroutes/backorders/flags orders. This all
+works. DO NOT rewrite it from scratch.
+
+## WHAT TO KEEP AS-IS
+- CSV loading/parsing logic
+- The fuzzy matching helper function and its thresholds (90% top score, 12-point margin)
+- Database schema and persistence logic
+- FastAPI endpoint structure and routes
+- Frontend (HTML/CSS/JS) — only extend it, don't redesign it
+- risk_config.json and the risk scoring formula/weights
+- llm_client.py's connection setup (API key, base URL, model name from env vars)
+
+## WHAT TO CHANGE
+Right now the pipeline is a fixed sequence of function calls written in Python:
+parse -> reconcile -> check_inventory -> compute_risk -> decide -> act. I want this
+converted into an explicit ReAct agent loop, where the LLM itself decides which tool to
+call next (via native OpenAI-compatible tool/function calling), rather than Python code
+dictating the sequence. The underlying logic of each step stays the same — you are
+changing *who decides the order of operations*, not *what each operation does*.
+
+### Step 1 — Wrap each existing function as an LLM-callable tool
+Take these existing functions (rename if needed, keep their internal logic):
+- reconcile_line_item(line_item_text) — your fuzzy match + LLM-fallback function.
+  IMPORTANT: expose the *fuzzy match candidate lookup* as the tool (returns top 3
+  candidates + scores), and let the ReAct agent's own reasoning pick the final SKU
+  from those candidates in its "Thought" step — don't have this tool silently call
+  another LLM internally when it's ambiguous, since that would hide reasoning from
+  the agent's own trace. If the top candidate already clears your existing
+  auto-accept threshold (90% + 12pt margin), the tool can just return that one
+  candidate with high confidence and the agent will accept it without extra reasoning.
+- check_primary_stock(sku, qty_needed)
+- check_alt_warehouse_stock(sku, qty_needed) — keep your existing negative-stock
+  anomaly flagging behavior exactly as it is
+- compute_risk_score(order_id, factors) — keep the existing config-driven weights
+- dispatch_order(order_id, line_items)
+- reroute_line_item(order_id, sku, qty, reason)
+- backorder_line_item(order_id, sku, qty, reason)
+- flag_for_human_review(order_id, reason)
+
+Write the OpenAI tools/function-calling JSON schema for each of these (name,
+description, parameters) in a new `tool_schemas.py`.
+
+### Step 2 — Build the ReAct loop
+Create `react_agent.py` with a function `run_agent_on_order(order)` that:
+1. Builds an initial message list: system prompt (see below) + user message containing
+   the order's raw data (client info, line_items_description)
+2. Calls the LLM with `tools=<all schemas>`, `tool_choice="auto"`
+3. If the model returns a tool_call: execute the corresponding real Python function,
+   append the tool call and its result (as a "tool" role message) to the conversation,
+   and loop back to step 2
+4. If the model returns a plain text/final message with no tool calls: treat that as
+   the agent's final summary and stop
+5. Cap iterations at 8 per order as a safety limit — if hit, force a
+   flag_for_human_review call with reason "max reasoning steps exceeded"
+6. Enforce ordering as a safety net in code: if the agent tries to call dispatch_order,
+   reroute_line_item, backorder_line_item, or flag_for_human_review before it has
+   called compute_risk_score at least once in this conversation, reject the tool call
+   by returning an error string as the tool result (e.g. "Error: you must call
+   compute_risk_score before taking a final action") instead of executing it, forcing
+   the agent to backtrack and do it properly.
+7. Log every single step (the model's reasoning/thought text if any, which tool was
+   called, what arguments, what the tool returned) to a new `agent_trace` table:
+   agent_trace(order_id, step_number, role, content, tool_name, tool_args, tool_result,
+   timestamp)
+
+### System prompt to use for the agent
+"You are a fulfillment agent for a wholesale PPE distributor. For the order given to
+you, reason step by step. For each line item: call reconcile_line_item to get catalog
+candidates, then decide which candidate (if any) is the correct match based on the
+scores and descriptions returned — explain your reasoning before deciding. Then check
+primary warehouse stock, and check alt warehouse stock if primary is short. Only after
+you have gathered all facts for every line item, call compute_risk_score. If risk is
+low, dispatch the order and/or reroute individual short items as needed. If risk is
+high, or you are not confident about any match, call flag_for_human_review instead of
+guessing. Never invent a SKU, stock number, or price — always call a tool to get it.
+State your reasoning in plain text before every tool call."
+
+### Step 3 — Replace the old pipeline call site
+Wherever your current code currently calls the fixed pipeline (e.g. in the /ingest
+endpoint, looping through orders and calling process_order(order) in a hard sequence),
+replace that call with run_agent_on_order(order) from react_agent.py. Keep the endpoint
+signature and response shape the same so the frontend doesn't break.
+
+### Step 4 — Extend (don't rebuild) the frontend
+Add a new section to the existing order-detail view that renders the agent_trace table
+as a readable step-by-step log, e.g.:
+"Step 1 — Thought: [text] -> Tool: reconcile_line_item('12x Hard Hat') -> Result: [3
+candidates with scores]"
+"Step 2 — Thought: [text] -> Tool: check_primary_stock('PPE-101', 12) -> Result: [...]"
+...ending with the final decision and action taken. This replaces or sits alongside
+whatever event-timeline view you already built — reuse existing CSS classes/styling
+where possible rather than introducing a new visual style.
+
+## NON-NEGOTIABLE CONSTRAINTS
+- Do not change the fuzzy matching thresholds, risk config weights, or database schema
+  for tables that already work correctly — only add the new agent_trace table
+- Use real native tool/function calling via the LLM API, not manual text parsing
+- The ordering safety check (risk score before final action) must be enforced in code,
+  not just requested in the prompt
+- Every step must be persisted so a human reviewer can see the full reasoning chain,
+  not just the final outcome
+- Confirm which parts of the existing codebase you are keeping unchanged before writing
+  any new code, so nothing that already works gets silently rewritten
