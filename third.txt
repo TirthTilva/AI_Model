@@ -1,0 +1,59 @@
+I need you to build a Python-based report reconciliation tool for our Hyperion (Oracle EPM)
+environment migrations (Dev -> UAT -> Prod). Please build this as a small, well-structured
+project, not a single throwaway script.
+
+CONTEXT
+Whenever we promote something from Dev to UAT, or UAT to Prod, we export the same report from
+both environments as .xlsx files and manually compare them cell-by-cell to make sure numbers
+match. Today this is done by hand in Excel (formula-subtract one sheet from another, copy the
+formula across all cells, eyeball for non-zero results). I want this automated.
+
+CORE REQUIREMENTS
+1. Input: two .xlsx report exports — a "Source" (e.g. Dev or UAT) file and a "Target"
+   (e.g. UAT or Prod) file. Same headers and same row order (identical layout), just from
+   different environments.
+2. Compare them cell by cell:
+   - Numeric cells: compute Target - Source (0 = match).
+   - Text/label cells: flag as MISMATCH if they differ.
+   - Handle missing rows/columns gracefully (one file longer than the other) without crashing.
+3. Output: one .xlsx workbook with these sheets, in this order:
+   - "Summary": pass/fail status, total cells compared, total issues found, and a table
+     listing every issue with its exact cell reference, source value, target value, and delta.
+   - "Source" and "Target": the two original reports, unmodified, side by side for reference.
+   - "Difference": same layout as the inputs, with computed deltas (not formulas), and every
+     non-zero / mismatched cell highlighted red with a distinct font so it's visible to a
+     human reviewer without opening a formula bar.
+   The goal is that anyone can still manually eyeball/verify the output later, the same way
+   they do today — automation should produce the same kind of artifact, just without manual
+   effort or formula copy-paste errors.
+4. CLI usage: 
+     python hyperion_report_diff.py <source.xlsx> <target.xlsx> <output.xlsx> [--sheet NAME] [--tolerance N]
+   --sheet lets the user pick a specific worksheet name (default: first sheet in each workbook).
+   --tolerance lets the user allow small numeric variances (default 0, exact match required).
+
+TECH
+- Python 3, openpyxl for reading/writing Excel (keep it dependency-light; pandas optional
+  only if it meaningfully simplifies things).
+- Clean, modular functions (load, diff, write-summary, write-diff-sheet) so it's easy to extend.
+- Type hints and docstrings.
+- Handle errors gracefully: missing file, unreadable sheet name, empty workbook — clear error
+  messages, not raw stack traces.
+
+STRETCH GOALS (build if time allows, but core flow above must work first and be testable)
+- Key-based row matching instead of strict row-position matching, for cases where row order
+  differs between environments (match on a configurable set of key columns, e.g. Account,
+  Entity, Period — configurable via a --key-columns flag).
+- A --watch <folder> mode that monitors a folder for new paired Source/Target files (matched
+  by filename convention) and auto-runs the diff, dropping the output in an /output subfolder.
+- Basic unit tests (pytest) covering: identical files (0 issues), numeric mismatch detection,
+  text mismatch detection, missing rows/columns, header mismatch.
+- A simple README.md explaining setup (pip install -r requirements.txt) and usage examples.
+
+DELIVERABLES
+- hyperion_report_diff.py (or a small package if you split it up)
+- requirements.txt
+- README.md with usage instructions and example command
+- (if stretch goals attempted) tests/ folder with pytest tests
+
+Please start by confirming the folder/file structure you'll create, then implement it,
+then walk me through how to run it against two sample .xlsx files to verify it works.
